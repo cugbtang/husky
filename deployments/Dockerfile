@@ -1,5 +1,6 @@
 # 构建阶段
-FROM golang:1.21-alpine AS builder
+# 注意：版本必须 >= go.mod 声明的 1.24.0，否则 go build 直接报错退出
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 

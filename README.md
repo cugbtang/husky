@@ -16,13 +16,40 @@
 
 ## 关于这个仓库
 
-> **这是 `ilibx/husky` 的研究型 fork，不是我的原创项目。**
+> **基于 `ilibx/husky` 的研究型 fork，不是我的原创项目。**
 >
 > - 上游：[**ilibx/husky**](https://github.com/ilibx/husky)（约 23 stars）
-> - 同步状态：与上游 `master` **完全一致**（`ahead_by=0, behind_by=0`），本仓库**未做任何本地修改**
-> - 这里存在的意义：作为一个**可运行的 Agent 工程标本**，用来拆解「Chatbot 之外，Agent 怎么真正嵌进业务流程」
+> - 本仓库在上游基础上做了**一处工程改造**：把 SLA 扫描从 API 进程里拆成独立 worker（见 [改动说明](#本仓库的改动)）
+> - 起点意义：它是一个**可运行的 Agent 工程标本**，用来拆解「Chatbot 之外，Agent 怎么真正嵌进业务流程」
 
-我把它当作学习材料，而不是作品。这个定位写在最前面，避免任何误解。
+上游的架构与全部业务实现归原作者所有；我改动的只有后台任务的生命周期管理。
+
+---
+
+## 本仓库的改动
+
+上游把 SLA 扫描器 `SLAEscalator` 直接起在 `router.SetupRouter()` 里（一个 5 分钟的 ticker）。这在单实例下没问题，但**一扩副本就出事**：每个 API 实例各跑一份扫描器，同一条超时工单会被重复升级、重复发站内通知、重复打 webhook。
+
+改动把后台任务从 API 进程剥离出来：
+
+| 文件 | 改动 |
+|---|---|
+| `cmd/worker/main.go` | 新增独立 worker 进程：`-interval` / `-once` / `-no-lock`，启动即扫一轮，之后按周期执行；SIGTERM 优雅退出 |
+| `cmd/worker/lock.go` | 用 PostgreSQL **advisory lock** 保证全局单例（会话级锁，进程崩溃自动释放，无需建表） |
+| `deployments/Dockerfile.worker` | worker 专用镜像，跳过前端构建（省一次 `npm ci` + `vite build`） |
+| `internal/ticket/sla.go` | 抽出纯函数 `DecideSLAAction`；新增 `RunOnce`；**修掉重复升级**：已 `breached` 的工单不再每轮重复通知 |
+| `internal/ticket/sla_decision_test.go` | 13 个表驱动用例覆盖决策分支（含非法配置回退） |
+| `internal/config/config.go` | 新增 `LoadWithFallback`：YAML 缺失时回退环境变量（镜像里不带 config.yaml 也能启动） |
+| `internal/router/router.go` | 内嵌扫描器改为受 `DISABLE_INPROC_ESCALATOR=1` 控制，默认行为不变（向后兼容） |
+| `deployments/Dockerfile` | `golang:1.21` → `golang:1.24`（低于 go.mod 声明会直接构建失败） |
+| `docker-compose.yml` | 补齐 worker 服务；API 侧关闭内嵌扫描器 |
+
+设计取舍：
+- **默认行为不变**——不设环境变量时，API 仍自带内嵌扫描器，老部署无需任何改动。
+- **worker 不执行 AutoMigrate**——schema 归 API 所有，两个进程同时迁移会打架，所以 compose 里让 worker 等 API 先启动。
+- **worker 不拉渠道客户端**——`SLAConfigService` 的 `eventHandler` 传 `nil`（内部已判空），worker 只负责站内通知 + 推送方式 + webhook；飞书等渠道消息仍由 API 侧 gateway 发送，避免同一个告警发两遍。
+
+验证情况：`go build ./...` 通过；`go test ./internal/ticket/ -run TestDecideSLAAction` 13/13 通过。**镜像未实机构建**（本机无 Docker），`docker compose up` 仅做了静态检查。
 
 ---
 
@@ -71,12 +98,16 @@ flowchart TD
 
     UI["Admin SPA · Vue3 + Element Plus<br/>go:embed 打进二进制"]
 
+    W["Worker 进程 · cmd/worker<br/>SLA 扫描 · advisory lock 单例"]
+
     CH --> G --> T
     G --> A
     T --> S
     S -->|"react 步骤"| A
     S -->|"human 步骤"| HITL
     HITL -->|"完成后继续"| S
+    W -->|"扫描超时工单"| T
+    W -.->|"站内通知 / webhook"| T
     A --> K
     K --> PG
     K -.-> NEO
@@ -131,10 +162,10 @@ flowchart TD
 - Docker + Docker Compose（起 PostgreSQL / Redis）
 - Node 20+（仅构建 Admin UI 时需要）
 
-### 路径 A：先让后端跑起来（最稳，3 条命令）
+### 路径 A：先让后端跑起来（最稳，4 条命令）
 
 ```bash
-# 1. 只起基础设施 —— 不要用 docker compose up 全量启动（见下方「已知限制」）
+# 1. 起基础设施
 docker compose up -d postgres redis
 
 # 2. 准备配置（config.yaml 是主配置，.env 已弃用）
@@ -142,7 +173,20 @@ cp config.yaml config.local.yaml   # 按需改数据库地址与 LLM Key
 
 # 3. 启动（内置 GORM AutoMigrate，开发环境无需手动迁移）
 go run ./cmd/api --config config.local.yaml
+
+# 4. 另开一个终端跑后台任务（SLA 扫描升级）
+go run ./cmd/worker --config config.local.yaml --interval 60s
 ```
+
+worker 常用参数：
+
+```bash
+go run ./cmd/worker -once      # 只扫一轮就退出，适合 cron 或本地调试
+go run ./cmd/worker -no-lock   # 跳过 advisory lock（仅本地单机调试）
+```
+
+> 不跑 worker 也能用：API 默认自带内嵌扫描器。只有在 API 多副本部署时，才必须设
+> `DISABLE_INPROC_ESCALATOR=1` 并改用 worker，否则每个副本都会各扫一遍。
 
 验证：
 
@@ -197,9 +241,14 @@ make test-coverage
 
 用之前先知道这四件事，能省半天时间：
 
-1. **`docker compose up -d` 会失败**
-   `docker-compose.yml` 里定义了 `worker` 服务，指向 `deployments/Dockerfile.worker`，但该文件不存在；`cmd/` 下也只有 `api` 和 `migrate`，**没有 worker 入口**。这是上游遗留的半成品。
-   → 起基础设施用 `docker compose up -d postgres redis`；起应用用 `api` 服务或本地 `go run`。
+1. ~~**`docker compose up -d` 会失败**~~ → **已修复**
+   上游 compose 里定义了 `worker` 服务，指向不存在的 `deployments/Dockerfile.worker`。本仓库已补上该镜像与 `cmd/worker` 入口，现在可以全量启动：
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+   注意 `api` 与 `worker` 都从环境变量取配置（镜像内不含 `config.yaml`），要改数据库/LLM 配置请编辑 compose 的 `environment`。
 
 2. **`/admin` 空白 = 前端没构建**
    `internal/admin/` 只有 `admin.go`，`static/` 目录是 `make web-build` 的产物、不入库。不构建就没有 UI。
@@ -218,7 +267,8 @@ make test-coverage
 husky/
 ├── cmd/
 │   ├── api/                    # API 入口（含 AutoMigrate）
-│   └── migrate/                # 独立迁移工具（SQL 脚本）
+│   ├── migrate/                # 独立迁移工具（SQL 脚本）
+│   └── worker/                 # 后台任务进程（SLA 扫描 + advisory lock 单例）
 ├── internal/
 │   ├── admin/                  # Admin SPA 的 go:embed 入口（static/ 为构建产物）
 │   ├── agent/                  # Agent 引擎 + SOP + Workflow + ReAct 循环 + 审批
@@ -345,7 +395,13 @@ go test ./... -v
 go test -coverprofile=coverage.out ./...
 ```
 
-当前测试覆盖 3 个包：`internal/model`、`internal/service`（auth）、`internal/ticket`（service）。**覆盖率不高**，这是上游现状——也是 fork 下来做实验最合适的切入点。
+当前测试覆盖 4 个包：`internal/model`、`internal/service`（auth）、`internal/ticket`（service + SLA 决策）。**整体覆盖率仍然不高**，这是上游现状。
+
+本仓库新增的部分有单测兜底：
+
+```bash
+go test ./internal/ticket/ -run TestDecideSLAAction -v   # 13 个用例
+```
 
 ---
 
@@ -353,8 +409,9 @@ go test -coverprofile=coverage.out ./...
 
 这是我 fork 它的真实意图，按优先级：
 
-- [ ] **补测试**：ReAct 循环与 SOP 状态推进是最该被测试保护的部分，目前零覆盖
-- [ ] **补齐 worker**：把 `cmd/worker` + `deployments/Dockerfile.worker` 落地，让 `docker compose up` 能一把起全栈
+- [x] **补齐 worker**：`cmd/worker` + `deployments/Dockerfile.worker` 已落地，`docker compose up` 可起全栈
+- [x] **SLA 决策测试**：`DecideSLAAction` 抽出纯函数 + 13 个用例
+- [ ] **补测试**：ReAct 循环与 SOP 状态推进仍是最该被测试保护的部分，目前零覆盖
 - [ ] **容器化改造**：K8s 部署清单（Deployment / HPA / ConfigMap / Secret），顺带练 GPU 无关的编排基本功
 - [ ] **接本地推理**：把 provider 指向 vLLM / Ollama，验证「私有化部署 + 本地模型」这条链路
 - [ ] **可观测性**：接入 Prometheus 指标（工单量、ReAct 轮次、LLM 延迟与 token 成本）

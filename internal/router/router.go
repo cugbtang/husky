@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"net/http"
+	"os"
 
 	"github.com/gin-gonic/gin"
 	"github.com/husky/husky/internal/admin"
@@ -167,7 +168,15 @@ func SetupRouter(cfg *config.Config, dbConn *repository.DatabaseConnection, log 
 	})
 	slaConfigSvc = ticket.NewSLAConfigService(slaConfigRepo, webhookRepo, sysCfgRepo, slaEventHandler, ticketRepo)
 	slaEscalator := ticket.NewSLAEscalator(ticketRepo, slaConfigSvc)
-	slaEscalator.Start(context.Background())
+
+	// 进程内 SLA 扫描器：默认启用（单实例部署无需额外进程）。
+	// 多副本或使用 cmd/worker 时，设置 DISABLE_INPROC_ESCALATOR=1 关闭它，
+	// 否则每个 API 副本都会各扫一遍，造成重复升级与重复通知。
+	if os.Getenv("DISABLE_INPROC_ESCALATOR") == "1" {
+		log.Info("In-process SLA escalator disabled, expecting external worker (cmd/worker)")
+	} else {
+		slaEscalator.Start(context.Background())
+	}
 
 	// --- Handlers ---
 	authHandler := handler.NewAuthHandler(authService, log)

@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strconv"
 
@@ -198,7 +200,7 @@ func setDefaults(cfg *Config) {
 
 func LoadConfigFromEnv() (*Config, error) {
 	cfg := &Config{
-		Cache:  CacheConfig{Enable: true},
+		Cache: CacheConfig{Enable: true},
 		Server: ServerConfig{
 			Port: getEnv("SERVER_PORT", "8080"),
 		},
@@ -260,4 +262,25 @@ func getEnvAsInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	return intValue
+}
+
+// LoadWithFallback 加载配置：优先读取 YAML 文件，文件不存在时回退到环境变量。
+//
+// 这样同一份二进制既能跑本地开发（config.yaml），也能直接跑容器
+// （镜像里不带 config.yaml，配置全部来自环境变量）。
+// 注意：显式指定了非默认路径却找不到文件时不会静默回退，避免掩盖路径写错的问题。
+func LoadWithFallback(path string) (*Config, error) {
+	cfg, err := LoadConfig(path)
+	if err == nil {
+		return cfg, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	if path != "" && path != "config.yaml" {
+		return nil, fmt.Errorf("%w (hint: 去掉 -config 参数即可回退到环境变量)", err)
+	}
+
+	fmt.Println("config file not found, falling back to environment variables")
+	return LoadConfigFromEnv()
 }

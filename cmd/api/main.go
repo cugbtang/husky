@@ -32,8 +32,8 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "Path to config YAML file")
 	flag.Parse()
 
-	// 从 YAML 加载配置
-	cfg, err := config.LoadConfig(*configPath)
+	// 从 YAML 加载配置；文件不存在时回退到环境变量（容器化部署场景）
+	cfg, err := config.LoadWithFallback(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
