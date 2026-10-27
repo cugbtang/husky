@@ -22,14 +22,13 @@ import (
 	"github.com/husky/husky/internal/repository"
 	"github.com/husky/husky/internal/ticket"
 	"github.com/husky/husky/pkg/logger"
+	"github.com/husky/husky/pkg/pglock"
 )
 
 const (
 	defaultInterval = time.Minute
 	// minInterval 兜底限制，避免手抖填 1s 把数据库打满
 	minInterval = 10 * time.Second
-	// advisoryLockKey 是 worker 进程级互斥锁的 key（ASCII "HUSK"）
-	advisoryLockKey int64 = 0x4855534B
 )
 
 // job 是一个可被调度执行的后台任务。
@@ -44,6 +43,7 @@ func main() {
 	interval := flag.Duration("interval", defaultInterval, "SLA 扫描间隔")
 	once := flag.Bool("once", false, "只执行一轮扫描后退出（适合 cron 或本地调试）")
 	noLock := flag.Bool("no-lock", false, "跳过多副本互斥锁（仅本地调试用）")
+	waitLock := flag.Bool("wait-lock", false, "拿不到锁时阻塞等待而不是退出（多副本 HA 部署用）")
 	flag.Parse()
 
 	if *interval < minInterval {
@@ -83,17 +83,34 @@ func main() {
 	// 两个进程同时迁移会互相打架。因此 worker 必须在 API 至少启动过一次之后再起。
 
 	if !*noLock {
-		release, ok, err := acquireSingletonLock(ctx, db, advisoryLockKey)
-		if err != nil {
-			logInstance.Fatal("Failed to acquire singleton lock", "error", err)
+		if *waitLock {
+			// HA 模式：多副本部署时，拿不到锁的副本原地待命，
+			// 等持有者退出（滚动更新 / 节点故障）后立刻接管，
+			// 而不是退出让 K8s 反复重启（那会变成 CrashLoop 式的重启风暴）。
+			logInstance.Info("Waiting for singleton lock (standby mode)")
+			release, err := pglock.AcquireBlocking(ctx, db, pglock.WorkerKey)
+			if err != nil {
+				if ctx.Err() != nil {
+					logInstance.Info("Cancelled while waiting for lock, exiting")
+					return
+				}
+				logInstance.Fatal("Failed to acquire singleton lock", "error", err)
+			}
+			defer release()
+			logInstance.Info("Singleton lock acquired", "key", pglock.WorkerKey)
+		} else {
+			release, ok, err := pglock.Acquire(ctx, db, pglock.WorkerKey)
+			if err != nil {
+				logInstance.Fatal("Failed to acquire singleton lock", "error", err)
+			}
+			if !ok {
+				// 已有实例在跑，当前进程直接退出，由编排层重启即可
+				logInstance.Warn("Another worker instance holds the lock, exiting")
+				return
+			}
+			defer release()
+			logInstance.Info("Singleton lock acquired", "key", pglock.WorkerKey)
 		}
-		if !ok {
-			// 已有实例在跑，当前进程直接退出，由编排层重启即可
-			logInstance.Warn("Another worker instance holds the lock, exiting")
-			return
-		}
-		defer release()
-		logInstance.Info("Singleton lock acquired", "key", advisoryLockKey)
 	}
 
 	ticketRepo := repository.NewTicketRepository(db)

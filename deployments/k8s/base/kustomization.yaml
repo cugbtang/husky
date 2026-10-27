@@ -1,0 +1,30 @@
+# base 只描述「应用本身」，不包含任何数据库实例。
+#
+# 生产环境外部依赖（Postgres、对象存储）应由平台提供或独立部署，
+# 不要和业务 Deployment 混在一个 kustomization 里——那会让
+# 「升级应用」变成「有概率动到数据库」的高危操作。
+#
+# 需要一把梭跑起来（kind / minikube / 本地验证）用 overlays/dev：
+#   kubectl apply -k deployments/k8s/overlays/dev
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: husky
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - api-deployment.yaml
+  - api-service.yaml
+  - api-hpa.yaml
+  - worker-deployment.yaml
+  - pdb.yaml
+  - ingress.yaml
+
+# 镜像 tag 集中在这里改，不用翻 Deployment
+images:
+  - name: ghcr.io/cugbtang/husky-api
+    newTag: 0.1.0
+  - name: ghcr.io/cugbtang/husky-worker
+    newTag: 0.1.0

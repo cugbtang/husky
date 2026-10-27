@@ -1,0 +1,21 @@
+# dev overlay：base + 一个单副本 Postgres，目标是一把梭跑起来。
+#
+#   kubectl apply -k deployments/k8s/overlays/dev
+#
+# 与 base 的差异只有两点：
+#   1. 多一个仅供自测的 Postgres（生产用托管库 / operator）
+#   2. 镜像 tag 用 dev，对应本地 build 后 kind load 的镜像
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: husky
+
+resources:
+  - ../../base
+  - postgres.yaml
+
+images:
+  - name: ghcr.io/cugbtang/husky-api
+    newTag: dev
+  - name: ghcr.io/cugbtang/husky-worker
+    newTag: dev

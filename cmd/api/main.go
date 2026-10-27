@@ -20,6 +20,7 @@ import (
 	"github.com/husky/husky/internal/repository"
 	"github.com/husky/husky/internal/router"
 	"github.com/husky/husky/pkg/logger"
+	"github.com/husky/husky/pkg/pglock"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 	"gorm.io/gorm"
@@ -64,17 +65,19 @@ func main() {
 	}
 	logInstance.Info("Database connected successfully")
 
-	// 自动迁移数据库 Schema
-	if err := database.AutoMigrate(db); err != nil {
-		logInstance.Fatal("Failed to migrate database", "error", err)
-	}
-	logInstance.Info("Database migration completed")
+	// 提前建立信号上下文：迁移阶段若收到 SIGTERM（K8s 缩容 / 滚动更新），
+	// 能及时中断等待中的锁并退出，而不是卡满 terminationGracePeriodSeconds。
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
 
-	// 初始化默认数据
-	seedDefaultRoles(db, logInstance)
-	seedDefaultAdmin(db, logInstance)
-	seedDefaultMenus(db, logInstance)
-	seedDefaultAgentAssets(db, logInstance)
+	// 自动迁移数据库 Schema + 初始化默认数据。
+	//
+	// 这两步必须串行：GORM 的 AutoMigrate 是「先查有无，再 CREATE/ALTER」，
+	// 多副本同时启动会在 Postgres 上撞 duplicate key on pg_type；seed 同理
+	// （并发 FirstOrCreate 会撞唯一索引）。所以整段包在 advisory lock 里，
+	// 后启动的副本排队等待，进来时发现已是最新 schema，空跑一遍即退出。
+	initSchemaAndSeeds(sigCtx, db, logInstance)
+	logInstance.Info("Database schema ready")
 
 	// 创建数据库连接包装
 	dbConn := &repository.DatabaseConnection{
@@ -124,6 +127,48 @@ func main() {
 
 const defaultAdminEmail = "admin@husky.local"
 const defaultAdminPassword = "admin123"
+
+// initSchemaAndSeeds 在分布式锁保护下完成 schema 迁移与默认数据初始化。
+//
+// 为什么要加锁（而不是直接调 database.AutoMigrate）：这个函数在每次 Pod 启动
+// 时都会执行。K8s 滚动更新或 HPA 扩容时会有多个 Pod 同时进入这里，而
+// GORM AutoMigrate 与 FirstOrCreate 都不是并发安全的——
+//   - AutoMigrate 并发建表 → Postgres: duplicate key value violates unique
+//     constraint "pg_type_typname_nsp_index"
+//   - seed 并发插入 → 唯一索引冲突
+//
+// 两种都会让进程 Fatal 退出，Pod 进 CrashLoopBackOff，表现为「一扩容就崩」。
+//
+// 用阻塞式 advisory lock 串行化：第一个副本真正干活，其余副本排队，
+// 拿到锁时 schema 已是最新，实际是空跑。
+//
+// SKIP_AUTOMIGRATE=1 用于「迁移交给独立 Job 执行」的部署方式（生产推荐：
+// 把 schema 变更和应用发布解耦，Pod 只负责起服务）。
+func initSchemaAndSeeds(ctx context.Context, db *gorm.DB, log *logger.Logger) {
+	if os.Getenv("SKIP_AUTOMIGRATE") == "1" {
+		log.Info("SKIP_AUTOMIGRATE=1, skipping migration and seeds (expects an external migration job)")
+		return
+	}
+
+	// 迁移可能因为等待其他副本而耗时，给足 3 分钟再放弃
+	lockCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	release, err := pglock.AcquireBlocking(lockCtx, db, pglock.MigrationKey)
+	if err != nil {
+		log.Fatal("Failed to acquire migration lock", "error", err)
+	}
+	defer release()
+
+	if err := database.AutoMigrate(db); err != nil {
+		log.Fatal("Failed to migrate database", "error", err)
+	}
+
+	seedDefaultRoles(db, log)
+	seedDefaultAdmin(db, log)
+	seedDefaultMenus(db, log)
+	seedDefaultAgentAssets(db, log)
+}
 
 func seedDefaultRoles(db *gorm.DB, log *logger.Logger) {
 	roles := []model.Role{

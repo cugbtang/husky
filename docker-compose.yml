@@ -19,19 +19,10 @@ services:
       timeout: 5s
       retries: 5
 
-  # Redis 缓存
-  redis:
-    image: redis:7-alpine
-    container_name: husky-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+  # 注意：这里曾经有一个 redis 服务，但 pkg/cache 里的 Redis 客户端
+  # 在整个项目里没有被实例化过（grep cache.NewRedis 无结果），
+  # 也就是说 redis 从来没被连接过——去掉它不影响任何功能，
+  # 反而少一个「以为在用其实没用」的依赖。真正需要缓存时再加回来。
 
   # Husky API 服务
   api:
@@ -50,8 +41,6 @@ services:
       - DB_PASSWORD=postgres
       - DB_NAME=husky
       - DB_SSLMODE=disable
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
       - JWT_SECRET=husky-secret-key-change-in-production
       - JWT_EXPIRE_HOUR=24
       # 后台扫描交给 worker 进程，API 不再内嵌 SLA escalator，避免重复升级
@@ -61,10 +50,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./logs:/app/logs
     restart: unless-stopped
 
   # Husky Worker 服务 (后台定时任务：SLA 扫描升级)
@@ -84,8 +69,6 @@ services:
       - DB_PASSWORD=postgres
       - DB_NAME=husky
       - DB_SSLMODE=disable
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
       - TZ=Asia/Shanghai
     depends_on:
       postgres:
@@ -97,7 +80,6 @@ services:
 
 volumes:
   postgres_data:
-  redis_data:
 
 networks:
   default:

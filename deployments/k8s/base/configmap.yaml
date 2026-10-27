@@ -1,0 +1,38 @@
+# 非敏感配置。API 与 worker 共用这一份。
+#
+# 注意：镜像里不带 config.yaml，应用启动时找不到配置文件会自动回退到环境变量
+# （见 internal/config.LoadWithFallback），所以这里的键名必须与
+# LoadConfigFromEnv 里读取的完全一致。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: husky-config
+  namespace: husky
+data:
+  SERVER_PORT: "8080"
+
+  # json 格式便于日志采集（Loki/ES）；本地排查可改 text
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+
+  DB_HOST: "postgres.husky.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "husky"
+
+  # 集群内默认不走 TLS。生产环境应改成 require / verify-full，
+  # 并把 CA 挂进来（DB_SSLMODE=verify-full 需要 root cert）。
+  DB_SSLMODE: "disable"
+
+  # ⚠️ 连接池必须按「副本数 × MaxOpenConns ≤ Postgres max_connections」反推。
+  # Postgres 默认 max_connections=100；HPA 上限 6 副本 × 25 = 150，已经超了。
+  # 所以这里压到 25，并在 HPA 上限（6 副本）时留出余量给 psql / 运维连接；
+  # 如果还要往上扩，正确做法是前置 PgBouncer，而不是继续加连接数。
+  DB_MAX_OPEN_CONNS: "25"
+  DB_MAX_IDLE_CONNS: "5"
+
+  JWT_EXPIRE_HOUR: "24"
+
+  # 后台 SLA 扫描已由 worker 独立进程承担。
+  # 这里必须关掉 API 进程内的内嵌扫描器，否则 API 每个副本都会扫一遍，
+  # 同一条超时工单会被重复升级 + 重复发通知。
+  DISABLE_INPROC_ESCALATOR: "1"

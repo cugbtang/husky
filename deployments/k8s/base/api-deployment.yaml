@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: husky-api
+  namespace: husky
+  labels:
+    app.kubernetes.io/name: husky
+    app.kubernetes.io/component: api
+spec:
+  # 至少 2 副本：1 副本时滚动更新和节点故障都会造成中断。
+  # 上限交给 HPA（见 api-hpa.yaml）。
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      # 0 = 先等新 Pod Ready 再杀旧 Pod，滚动期间可用副本数不下降。
+      # 代价是发布时会短暂多占 1 个副本的资源。
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: husky
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: husky
+        app.kubernetes.io/component: api
+    spec:
+      # SIGTERM 后：preStop sleep 5s（等服务端点摘流量）+ 应用 5s 优雅关闭 + 余量
+      terminationGracePeriodSeconds: 30
+
+      securityContext:
+        runAsNonRoot: true
+        # 必须与 Dockerfile 里 adduser 的 uid 一致（10001），
+        # 否则 Pod 会因权限不足写临时文件失败。
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # 尽量把副本打散到不同节点：单节点故障不至于打掉全部 API
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: husky
+              app.kubernetes.io/component: api
+
+      containers:
+        - name: api
+          image: ghcr.io/cugbtang/husky-api:0.1.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: husky-config
+            - secretRef:
+                name: husky-secret
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          resources:
+            # requests 决定 HPA 的扩容基线（CPU 目标 70% 即 140m）
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+
+          # 启动探针：首次启动要跑 AutoMigrate（多副本时还要排队等锁），
+          # 给它最多 36 × 5s = 180s。成功一次后才会开始执行 liveness/readiness，
+          # 这样「启动慢」不会被误判成「进程死了」而被反复杀掉。
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+
+          # 存活探针：只检查进程本身，**不查数据库**。
+          # 如果在 liveness 里查 DB，数据库抖动会让所有 Pod 一起重启，
+          # 把「暂时读不到数据」升级成「整个服务不可用」。
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # 就绪探针：查真实依赖（数据库连通性）。
+          # DB 不通时返回 503 → 该 Pod 被摘出 Endpoints，流量转给其他副本，
+          # 但 Pod 不会被重启，DB 恢复后自动重新就绪。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+            successThreshold: 1
+
+          lifecycle:
+            preStop:
+              exec:
+                # 给 kube-proxy / Ingress 一点时间把本 Pod 从 Endpoints 摘掉，
+                # 避免「已经收到 SIGTERM、还在处理请求」时新请求打进来报 502
+                command: ["sleep", "5"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # readOnlyRootFilesystem 下仍需要可写的临时目录（上传临时文件、Go 运行时）
+        - name: tmp
+          emptyDir: {}

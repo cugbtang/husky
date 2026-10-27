@@ -1,0 +1,32 @@
+# PodDisruptionBudget：节点维护（drain/upgrade）时保证不被打光。
+#
+# 没有 PDB 时，kubectl drain 会一次性把节点上所有 Pod 驱逐，
+# 2 副本恰好落在同一节点就会整服务中断。
+#
+# minAvailable 与 replicas 的关系要算清楚：
+#   api    replicas 2，minAvailable 1 → 最多允许 1 个同时不可用
+#   worker replicas 2，minAvailable 1 → 持有锁的那个被驱逐时，待命者接管
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: husky-api
+  namespace: husky
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: husky
+      app.kubernetes.io/component: api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: husky-worker
+  namespace: husky
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: husky
+      app.kubernetes.io/component: worker

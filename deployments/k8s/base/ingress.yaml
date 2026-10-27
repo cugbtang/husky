@@ -1,0 +1,35 @@
+# Ingress（需要集群已装 ingress-nginx）
+#
+# 说明：应用同时提供两类路由，都由同一个 Service 承接
+#   /api/*    → REST API
+#   /admin*   → 内嵌在二进制里的 Vue 管理台（go:embed admin/static）
+#   其他路径  → 由 gin 的 NoRoute 回落到管理台 SPA
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: husky-api
+  namespace: husky
+  annotations:
+    # 附件上传：默认 1m 会直接把上传打断
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    # 后端是长连接的 LLM 流式响应时，读超时要放宽（默认 60s 会被截断）
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: husky.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: husky-api
+                port:
+                  name: http
+  # 启用 TLS 时打开下面这段，并把证书放进同一个 namespace 的 Secret
+  # tls:
+  #   - hosts:
+  #       - husky.example.com
+  #     secretName: husky-tls

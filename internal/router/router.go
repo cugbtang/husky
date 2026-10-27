@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/husky/husky/internal/admin"
@@ -225,8 +226,36 @@ func SetupRouter(cfg *config.Config, dbConn *repository.DatabaseConnection, log 
 		c.JSON(http.StatusOK, gin.H{"service": "husky-api", "status": "running"})
 	})
 
+	// /health 只表示「进程还活着」，**不查任何外部依赖**，供 liveness 探针使用。
+	// 如果 liveness 里查数据库，DB 抖一下 K8s 就会把所有 Pod 一起重启，
+	// 把「暂时读不到数据」升级成「整个服务不可用」。
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "healthy"})
+	})
+
+	// /readyz 表示「能不能接流量」，必须查真实依赖，供 readiness 探针使用。
+	// DB 不通时返回 503，K8s 只会把这个 Pod 从 Service Endpoints 摘掉
+	// （流量转给其他副本），不会重启它——等 DB 恢复自然重新就绪。
+	r.GET("/readyz", func(c *gin.Context) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+
+		sqlDB, err := dbConn.DB.DB()
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status": "not ready",
+				"reason": "database handle unavailable",
+			})
+			return
+		}
+		if err := sqlDB.PingContext(ctx); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status": "not ready",
+				"reason": "database unreachable",
+			})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 
 	// Setup permissions loader for fine-grained RBAC

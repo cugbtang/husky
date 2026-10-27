@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: husky
+  labels:
+    app.kubernetes.io/name: husky
+    app.kubernetes.io/part-of: husky

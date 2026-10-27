@@ -1,0 +1,49 @@
+# 只对无状态的 API 做水平扩容。
+#
+# 为什么 worker 不能挂 HPA：它是单例语义（全局唯一扫描者），
+# 扩副本不会提升吞吐，只会让更多 Pod 排队等锁。
+# 这是「有状态后台任务」和「无状态服务」在扩容策略上的本质区别。
+#
+# 前置条件：集群必须装 metrics-server（kind/minikube 需手动装），
+# 否则 HPA 读不到指标，会一直显示 <unknown>。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: husky-api
+  namespace: husky
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: husky-api
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # 相对 requests（200m）的利用率：70% → 140m 触发扩容
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      # 扩容宁快勿慢：15 秒内可以翻倍，避免排队堆积
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 2
+          periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      # 缩容宁慢勿快：5 分钟稳定窗口，避免指标抖动导致副本反复增减。
+      # 注意：新 Pod 启动时会走一次 AutoMigrate（有 advisory lock 排队），
+      # 频繁伸缩会放大这个开销，所以缩容窗口比默认 300s 更保守。
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

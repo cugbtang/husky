@@ -1,0 +1,144 @@
+# 后台任务进程：SLA 超时扫描、通知外发。
+#
+# 为什么单独一个 Deployment 而不是塞回 API：
+#   API 是无状态的，可以随便扩副本；后台扫描必须全局唯一。
+#   两者混在一个进程里，API 一扩容就会「每个副本各扫一遍」，
+#   同一条超时工单被重复升级、重复发通知、重复打 webhook。
+#
+# 这里 replicas: 2 + -wait-lock 的组合是刻意的：
+#   - 1 个 Pod 真正持有 advisory lock 在扫描（active）
+#   - 另 1 个 Pod 阻塞在拿锁上待命（standby）
+#   - 持有者所在节点故障 / 滚动更新时，待命者立刻接管，没有空窗
+#   锁本身由 pkg/pglock 提供：会话级 advisory lock，进程崩溃时数据库会话结束，
+#   锁自动释放，不会留下「死锁残留」需要人工介入。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: husky-worker
+  namespace: husky
+  labels:
+    app.kubernetes.io/name: husky
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: husky
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: husky
+        app.kubernetes.io/component: worker
+    spec:
+      terminationGracePeriodSeconds: 20
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: husky
+              app.kubernetes.io/component: worker
+
+      initContainers:
+        # worker 不执行 AutoMigrate（schema 归 API 所有，两个进程同时迁移会打架），
+        # 所以必须先确认 API 已经把表建好，否则一启动就是 "relation does not exist"。
+        # 这里直接查 to_regclass，而不是靠 sleep 猜时间。
+        - name: wait-for-schema
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              echo "waiting for schema (table tickets) ..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                if PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" \
+                     -U "$DB_USER" -d "$DB_NAME" -tAc \
+                     "SELECT to_regclass('public.tickets') IS NOT NULL" 2>/dev/null | grep -q '^t$'; then
+                  echo "schema ready"
+                  exit 0
+                fi
+                i=$((i + 1))
+                sleep 2
+              done
+              echo "timeout: schema not ready after 120s" >&2
+              exit 1
+          envFrom:
+            - configMapRef:
+                name: husky-config
+            - secretRef:
+                name: husky-secret
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: worker
+          image: ghcr.io/cugbtang/husky-worker:0.1.0
+          imagePullPolicy: IfNotPresent
+
+          # -wait-lock：拿不到锁时待在原地而不是退出，
+          # 避免 K8s 反复重启待命副本（RestartPolicy: Always 下那个循环很吵）
+          args: ["-interval", "60s", "-wait-lock"]
+
+          envFrom:
+            - configMapRef:
+                name: husky-config
+            - secretRef:
+                name: husky-secret
+
+          env:
+            # worker 只需要「一条持锁连接 + 少量查询连接」，不需要 API 那么大的池
+            - name: DB_MAX_OPEN_CONNS
+              value: "5"
+            - name: DB_MAX_IDLE_CONNS
+              value: "2"
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,145 @@
+# ⚠️ 仅供本地 / kind / minikube 自测的 Postgres。
+#
+# 生产绝对不要用这个文件：单副本、无备份、无 PITR、数据在本地 PV 上。
+# 生产应当用云托管 PG，或至少 CloudNativePG / Zalando operator 管理的集群。
+#
+# 这个文件的存在只是为了「kubectl apply -k overlays/dev 之后真的能跑起来」，
+# 而不是让 base 里出现一个不该由应用负责的数据库。
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: husky
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+---
+# StatefulSet 需要 headless service 提供稳定网络标识
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: husky
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+---
+# ⚠️ 必须有 pgvector 扩展：internal/model/knowledge.go 里有 vector(1536) 列，
+# 扩展不存在时 GORM AutoMigrate 会直接失败（type "vector" does not exist），
+# API 进程 Fatal → Pod CrashLoopBackOff。
+# 官方 postgres 镜像不带这个扩展，所以这里用 pgvector/pgvector（与 docker-compose 一致）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-initdb
+  namespace: husky
+data:
+  # 只在数据目录为空的首次初始化时执行；已有 PVC 不会重跑
+  01-extensions.sql: |
+    CREATE EXTENSION IF NOT EXISTS vector;
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: husky
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # 官方 postgres 镜像内置的 postgres 用户就是 uid/gid 70
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # 不设 readOnlyRootFilesystem：Postgres 需要写 /var/run/postgresql
+            # 与 /tmp，强行只读会导致 initdb 失败
+          ports:
+            - name: pg
+              containerPort: 5432
+          env:
+            # 用户名/密码复用应用 Secret，避免 dev 环境出现两套凭据
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: husky-secret
+                  key: DB_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: husky-secret
+                  key: DB_PASSWORD
+            - name: POSTGRES_DB
+              value: husky
+            # 官方镜像的经典坑：直接把 PGDATA 指到挂载点根目录会因 lost+found
+            # 导致 initdb 失败，必须放在子目录里
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "husky", "-d", "husky"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "husky", "-d", "husky"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: initdb
+          configMap:
+            name: postgres-initdb
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
