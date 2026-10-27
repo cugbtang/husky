@@ -19,7 +19,7 @@
 > **基于 `ilibx/husky` 的研究型 fork，不是我的原创项目。**
 >
 > - 上游：[**ilibx/husky**](https://github.com/ilibx/husky)（约 23 stars）
-> - 本仓库在上游基础上做了**两处工程改造**：① 把 SLA 扫描从 API 进程里拆成独立 worker；② 补齐一套真能跑起来的 K8s 部署清单（见 [改动说明](#本仓库的改动)）
+> - 本仓库在上游基础上做了**三处工程改造**：① 把 SLA 扫描从 API 进程里拆成独立 worker；② 补齐一套真能跑起来的 K8s 部署清单；③ 把 ReAct 循环改成可测的编排层（并修掉两个真 bug）（见 [改动说明](#本仓库的改动)）
 > - 起点意义：它是一个**可运行的 Agent 工程标本**，用来拆解「Chatbot 之外，Agent 怎么真正嵌进业务流程」
 
 上游的架构与全部业务实现归原作者所有；我改动的是后台任务的生命周期管理、镜像构建链与部署编排。
@@ -57,6 +57,28 @@
 | `scripts/validate-k8s.py` | 离线校验清单引用一致性（无集群环境可用） |
 | `docker-compose.yml` | 去掉从未被使用的 `redis` 服务与 `./logs` 绑定挂载（代码不写日志文件，全部走 stdout） |
 
+**③ 让 ReAct 循环可测（并修掉两个真 bug）**
+
+ReAct 循环是整个 Agent 的核心，却也是最难验证的部分：它直接写在 `WorkflowService` 方法里，仓储是具体类型、LLM 是具体类型，想验证只有一条路——起一个真 PG + 接一个真模型，跑一遍看结果对不对。于是它长期零测试覆盖。
+
+| 文件 | 改动 |
+|---|---|
+| `internal/agent/react_loop.go` | 新增：`reactToolset` 接口隔离 DB / LLM 副作用，`runReActLoop` 只做编排决策 |
+| `internal/agent/react_loop.go` | 新增 `parseReActAction`：剥 ```` ```json ```` 围栏 → 截取第一个花括号平衡的 JSON 对象 → 校验 `action` 非空 |
+| `internal/agent/workflow_react.go` | `reActLoop` 退化为适配层（组装 config + toolset），编排逻辑全部搬进纯函数 |
+| `internal/agent/react_loop_test.go` | 22 个子用例：完整轨迹 + 解析器 + 历史窗口 + 队列消息拼接 + `agentCapabilityScore` |
+
+两个顺带修掉的 bug：
+
+1. **模型输出套了 ```` ```json ```` 代码块就必然解析失败。** 上游直接对整段输出做 `json.Unmarshal`——实测 `` ```json\n{...}\n``` `` 报 `invalid character '`'`，「Here is my action: {...}」报 `invalid character 'S'`。更糟的是失败后循环只是重试，10 轮耗尽后执行 `completeStep(ctx, step, "reached max rounds, auto-completed")`——**一个什么都没做的步骤被标记成「已完成」**。这类静默失败在生产里最难查。
+2. **队列版循环只取 `messages[0]`。** 一批用户消息涌入时，除第一条外全部被丢弃，模型看到的历史是残缺的。改为全部拼接。
+
+设计取舍：
+- **不改变对外行为**——工具名、提示词、`complete`/`fail` 语义、轮数耗尽自动完成（虽然语义可疑，但它是上游契约）全部保持原样；这一轮只做「可测化 + 解析健壮性」。
+- **接口开在副作用边界上**，不开在仓储上：只需要假工具 6 个方法就能驱动整个循环，不需要 mock GORM。
+
+---
+
 设计取舍：
 - **默认行为不变**——不设环境变量时，API 仍自带内嵌扫描器，老部署无需任何改动。
 - **worker 不执行 AutoMigrate**——schema 归 API 所有，两个进程同时迁移会打架，所以 compose 里让 worker 等 API 先启动，K8s 里用 initContainer 查 `to_regclass('public.tickets')` 等表就绪。
@@ -65,6 +87,7 @@
 验证情况：
 - ✅ `go build ./...`、`go vet` 通过
 - ✅ `go test ./internal/ticket/ -run TestDecideSLAAction` 13/13 通过
+- ✅ `go test ./internal/agent/` 22 个子用例全部通过（`internal/agent` 从零覆盖变为有覆盖）
 - ✅ `kubectl kustomize` 渲染 base / dev overlay 通过；`scripts/validate-k8s.py` 全部检查通过
 - ⚠️ **镜像未实机构建、清单未在真实集群 apply**（本机无 Docker / 无可用集群）。Dockerfile 与清单做的是静态校验，首次在集群里跑仍可能需要调（例如 StorageClass 名字、ingress 控制器差异）
 
@@ -495,13 +518,20 @@ go test ./... -v
 go test -coverprofile=coverage.out ./...
 ```
 
-当前测试覆盖 4 个包：`internal/model`、`internal/service`（auth）、`internal/ticket`（service + SLA 决策）。**整体覆盖率仍然不高**，这是上游现状。
+当前测试覆盖 4 个包：`internal/model`、`internal/service`（auth）、`internal/ticket`（service + SLA 决策）、`internal/agent`（ReAct 循环）。**整体覆盖率仍然不高**，这是上游现状。
 
 本仓库新增的部分有单测兜底：
 
 ```bash
 go test ./internal/ticket/ -run TestDecideSLAAction -v   # 13 个用例
+go test ./internal/agent/ -run 'TestRunReActLoop|TestParseReActAction' -v   # ReAct 循环 22 个子用例
 ```
+
+ReAct 循环原来是「起真 PG + 真模型才能验证」的黑盒，这次把它拆成可测的编排层（见下方「对上游的实质改动」）：
+
+- `reactToolset` 接口隔离 DB / LLM 副作用，`runReActLoop` 只做编排 → 用假工具就能跑完整轨迹
+- 覆盖：正常 `complete`、`search_kb` 观察值回灌、非法 JSON 纠错重试、未知工具反馈、`fail`、LLM 报错、轮数耗尽、历史窗口裁剪
+- 顺带修掉两个真 bug：**模型把 JSON 包在 ```` ```json ```` 里时解析必失败**（上游会一路重试到轮数耗尽，然后把什么都没做的步骤标记为「已完成」）；**队列版循环只取 `messages[0]`**，一批涌入的多条用户消息被静默丢弃
 
 ---
 
@@ -513,7 +543,8 @@ go test ./internal/ticket/ -run TestDecideSLAAction -v   # 13 个用例
 - [x] **SLA 决策测试**：`DecideSLAAction` 抽出纯函数 + 13 个用例
 - [x] **容器化改造**：`deployments/k8s/`（Deployment / HPA / PDB / Ingress / ConfigMap / Secret + dev overlay）
 - [x] **探针拆分**：`/health` 与 `/readyz` 分离，迁移并发问题用 advisory lock 解决
-- [ ] **补测试**：ReAct 循环与 SOP 状态推进仍是最该被测试保护的部分，目前零覆盖
+- [x] **ReAct 循环测试**：抽出 `reactToolset` 接口 + `parseReActAction` 纯函数，22 个子用例覆盖完整轨迹
+- [ ] **SOP 状态推进测试**：步骤流转仍是最该被测试保护的部分，目前零覆盖
 - [ ] **接本地推理**：把 provider 指向 vLLM / Ollama，验证「私有化部署 + 本地模型」这条链路
 - [ ] **可观测性**：接入 Prometheus 指标（工单量、ReAct 轮次、LLM 延迟与 token 成本）
 

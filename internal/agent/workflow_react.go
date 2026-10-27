@@ -11,16 +11,13 @@ import (
 	"github.com/husky/husky/pkg/llm"
 )
 
-type roundHist struct {
-	action ReActAction
-	result string
-}
-
 type ticketUpdate struct {
 	Status   string `json:"status"`
 	Priority string `json:"priority"`
 }
 
+// reActLoop 是 ReAct 循环的适配层：把 DB/LLM 依赖组装成 reactLoopConfig + reactToolset，
+// 真正的编排逻辑在 react_loop.go 的 runReActLoop 里（可脱离 DB 与真实模型测试）。
 func (s *WorkflowService) reActLoop(ctx context.Context, step *model.WorkflowStep, ticket *model.Ticket, wf *model.Workflow) {
 	if s.chatSvc == nil {
 		s.failStep(ctx, step, "LLM not configured")
@@ -33,6 +30,27 @@ func (s *WorkflowService) reActLoop(ctx context.Context, step *model.WorkflowSte
 		return
 	}
 
+	goal := reactGoal(step)
+	cfg := reactLoopConfig{
+		StepName:       step.Name,
+		Goal:           goal,
+		TicketTitle:    ticket.Title,
+		TicketStatus:   ticket.Status,
+		TicketPriority: ticket.Priority,
+		Description:    ticket.Description,
+		KBContext:      s.buildKBContext(ctx, ticket, goal),
+		Model:          agent.Model,
+		Temperature:    agent.Temperature,
+		MaxTokens:      agent.MaxTokens,
+		MaxRounds:      defaultReActMaxRounds,
+		HistoryWindow:  defaultReActHistoryWindow,
+	}
+
+	runReActLoop(ctx, cfg, &workflowReactTools{svc: s, step: step, ticket: ticket, agent: agent})
+}
+
+// reactGoal 取步骤配置里的 goal，缺省回落到步骤名。
+func reactGoal(step *model.WorkflowStep) string {
 	var stepCfg struct {
 		Goal string `json:"goal"`
 	}
@@ -41,11 +59,14 @@ func (s *WorkflowService) reActLoop(ctx context.Context, step *model.WorkflowSte
 			log.Printf("reActLoop: failed to parse step config: %v", err)
 		}
 	}
-	goal := stepCfg.Goal
-	if goal == "" {
-		goal = step.Name
+	if stepCfg.Goal != "" {
+		return stepCfg.Goal
 	}
+	return step.Name
+}
 
+// buildKBContext 按「工单标题 + 描述 + 目标」检索知识库，拼成提示词里的知识片段。
+func (s *WorkflowService) buildKBContext(ctx context.Context, ticket *model.Ticket, goal string) string {
 	kbResults, _ := s.kbRepo.SearchSimilar(ctx, model.KnowledgeQuery{
 		Query: fmt.Sprintf("%s %s %s", ticket.Title, ticket.Description, goal),
 		Limit: 4,
@@ -54,102 +75,45 @@ func (s *WorkflowService) reActLoop(ctx context.Context, step *model.WorkflowSte
 	for _, r := range kbResults {
 		kbContext += fmt.Sprintf("- %s: %s\n", r.Title, r.Content)
 	}
+	return kbContext
+}
 
-	systemPrompt := fmt.Sprintf(`You are an AI agent executing SOP steps. You MUST respond with valid JSON only:
-{"thought":"...","action":"tool_name","action_input":"..."}
+// workflowReactTools 把 ReAct 循环的副作用接回真实的仓储与 LLM。
+type workflowReactTools struct {
+	svc    *WorkflowService
+	step   *model.WorkflowStep
+	ticket *model.Ticket
+	agent  *model.Agent
+}
 
-Tools:
-- search_kb: Search knowledge base. Input: search query string
-- reply_user: Reply to user. Input: your response text
-- update_ticket: Update ticket status or priority. Input: JSON like {"status":"resolved"}
-- complete: Mark this step done. Input: result summary
-- fail: Mark this step failed. Input: reason
+func (t *workflowReactTools) Chat(ctx context.Context, req *llm.ChatRequest) (*llm.ChatResponse, error) {
+	return t.svc.chatSvc.Chat(ctx, req)
+}
 
-Step: %s
-Goal: %s
-Ticket: %s | Status: %s | Priority: %s
-Description: %s
+func (t *workflowReactTools) SearchKB(ctx context.Context, query string) string {
+	return t.svc.executeSearchKB(ctx, query)
+}
 
-Relevant knowledge:
-%s
+func (t *workflowReactTools) ReplyUser(ctx context.Context, msg string) {
+	t.svc.executeReplyUser(ctx, t.ticket, t.agent, msg)
+}
 
-Stay focused. When goal achieved, use "complete".`, step.Name, goal, ticket.Title, ticket.Status, ticket.Priority, ticket.Description, kbContext)
+func (t *workflowReactTools) UpdateTicket(ctx context.Context, input string) string {
+	return t.svc.executeUpdateTicket(ctx, t.ticket, input)
+}
 
-	var history []roundHist
-	maxRounds := 10
+func (t *workflowReactTools) CompleteStep(ctx context.Context, summary string) {
+	t.svc.ticketRepo.AddComment(ctx, &model.Comment{
+		TicketID:   t.ticket.ID,
+		UserID:     t.svc.agentUserID,
+		Content:    fmt.Sprintf("[Agent: %s] Step completed: %s\nResult: %s", t.agent.Name, t.step.Name, summary),
+		IsInternal: true,
+	})
+	t.svc.completeStep(ctx, t.step, summary)
+}
 
-	for roundIdx := 0; roundIdx < maxRounds; roundIdx++ {
-		var historyText string
-		start := 0
-		if len(history) > 5 {
-			start = len(history) - 5
-		}
-		for i := start; i < len(history); i++ {
-			h := history[i]
-			historyText += fmt.Sprintf("Round %d: thought=%s action=%s input=%s\n  -> %s\n",
-				i+1, h.action.Thought, h.action.Action, h.action.ActionInput, h.result)
-		}
-
-		messages := []llm.ChatMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: fmt.Sprintf("Current state: step=%s, ticket_status=%s\nHistory:\n%s\n\nWhat should I do next?", step.Name, ticket.Status, historyText)},
-		}
-
-		resp, err := s.chatSvc.Chat(ctx, &llm.ChatRequest{
-			Model:       agent.Model,
-			Messages:    messages,
-			Temperature: agent.Temperature,
-			MaxTokens:   agent.MaxTokens,
-		})
-		if err != nil {
-			s.failStep(ctx, step, fmt.Sprintf("LLM error: %v", err))
-			return
-		}
-
-		var action ReActAction
-		if err := json.Unmarshal([]byte(resp.Content), &action); err != nil {
-			history = append(history, roundHist{
-				action: ReActAction{Thought: "parse_error", Action: "invalid_json", ActionInput: resp.Content},
-				result: "Your response was not valid JSON. Respond only with the JSON format.",
-			})
-			continue
-		}
-
-		log.Printf("ReAct [%s] round %d: %s -> %s(%s)", step.Name, roundIdx+1, action.Thought, action.Action, action.ActionInput)
-
-		switch action.Action {
-		case "search_kb":
-			result := s.executeSearchKB(ctx, action.ActionInput)
-			history = append(history, roundHist{action: action, result: result})
-
-		case "reply_user":
-			s.executeReplyUser(ctx, ticket, agent, action.ActionInput)
-			history = append(history, roundHist{action: action, result: "replied to user"})
-
-		case "update_ticket":
-			result := s.executeUpdateTicket(ctx, ticket, action.ActionInput)
-			history = append(history, roundHist{action: action, result: result})
-
-		case "complete":
-			s.ticketRepo.AddComment(ctx, &model.Comment{
-				TicketID:   ticket.ID,
-				UserID:     s.agentUserID,
-				Content:    fmt.Sprintf("[Agent: %s] Step completed: %s\nResult: %s", agent.Name, step.Name, action.ActionInput),
-				IsInternal: true,
-			})
-			s.completeStep(ctx, step, action.ActionInput)
-			return
-
-		case "fail":
-			s.failStep(ctx, step, action.ActionInput)
-			return
-
-		default:
-			history = append(history, roundHist{action: action, result: fmt.Sprintf("unknown tool '%s', use one of: search_kb, reply_user, update_ticket, complete, fail", action.Action)})
-		}
-	}
-
-	s.completeStep(ctx, step, "reached max rounds, auto-completed")
+func (t *workflowReactTools) FailStep(ctx context.Context, reason string) {
+	t.svc.failStep(ctx, t.step, reason)
 }
 
 func (s *WorkflowService) executeSearchKB(ctx context.Context, query string) string {
@@ -270,14 +234,14 @@ func (s *WorkflowService) reActLoopWithQueue(ctx context.Context, step *model.Wo
 			}
 			messages = append(messages, msg)
 			if len(messages) >= 16 {
-				step.Result += fmt.Sprintf("\n[User]: %s", messages[0])
+				step.Result += formatQueuedUserMessages(messages)
 				s.wfRepo.UpdateStep(ctx, step)
 				s.reActLoop(ctx, step, ticket, wf)
 				messages = nil
 			}
 		default:
 			if len(messages) > 0 {
-				step.Result += fmt.Sprintf("\n[User]: %s", messages[0])
+				step.Result += formatQueuedUserMessages(messages)
 				s.wfRepo.UpdateStep(ctx, step)
 				s.reActLoop(ctx, step, ticket, wf)
 				messages = nil
