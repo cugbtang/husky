@@ -19,7 +19,7 @@
 > **基于 `ilibx/husky` 的研究型 fork，不是我的原创项目。**
 >
 > - 上游：[**ilibx/husky**](https://github.com/ilibx/husky)（约 23 stars）
-> - 本仓库在上游基础上做了**三处工程改造**：① 把 SLA 扫描从 API 进程里拆成独立 worker；② 补齐一套真能跑起来的 K8s 部署清单；③ 把 ReAct 循环改成可测的编排层（并修掉两个真 bug）（见 [改动说明](#本仓库的改动)）
+> - 本仓库在上游基础上做了**四处工程改造**：① 把 SLA 扫描从 API 进程里拆成独立 worker；② 补齐一套真能跑起来的 K8s 部署清单；③ 把 ReAct 循环改成可测的编排层（并修掉两个真 bug）；④ 把 SOP 步骤状态推进抽成纯函数（并修掉人工步骤「永不超时」）（见 [改动说明](#本仓库的改动)）
 > - 起点意义：它是一个**可运行的 Agent 工程标本**，用来拆解「Chatbot 之外，Agent 怎么真正嵌进业务流程」
 
 上游的架构与全部业务实现归原作者所有；我改动的是后台任务的生命周期管理、镜像构建链与部署编排。
@@ -57,6 +57,11 @@
 | `scripts/validate-k8s.py` | 离线校验清单引用一致性（无集群环境可用） |
 | `docker-compose.yml` | 去掉从未被使用的 `redis` 服务与 `./logs` 绑定挂载（代码不写日志文件，全部走 stdout） |
 
+①② 的设计取舍：
+- **默认行为不变**——不设环境变量时，API 仍自带内嵌扫描器，老部署无需任何改动。
+- **worker 不执行 AutoMigrate**——schema 归 API 所有，两个进程同时迁移会打架，所以 compose 里让 worker 等 API 先启动，K8s 里用 initContainer 查 `to_regclass('public.tickets')` 等表就绪。
+- **worker 不拉渠道客户端**——`SLAConfigService` 的 `eventHandler` 传 `nil`（内部已判空），worker 只负责站内通知 + 推送方式 + webhook；飞书等渠道消息仍由 API 侧 gateway 发送，避免同一个告警发两遍。
+
 **③ 让 ReAct 循环可测（并修掉两个真 bug）**
 
 ReAct 循环是整个 Agent 的核心，却也是最难验证的部分：它直接写在 `WorkflowService` 方法里，仓储是具体类型、LLM 是具体类型，想验证只有一条路——起一个真 PG + 接一个真模型，跑一遍看结果对不对。于是它长期零测试覆盖。
@@ -77,19 +82,35 @@ ReAct 循环是整个 Agent 的核心，却也是最难验证的部分：它直�
 - **不改变对外行为**——工具名、提示词、`complete`/`fail` 语义、轮数耗尽自动完成（虽然语义可疑，但它是上游契约）全部保持原样；这一轮只做「可测化 + 解析健壮性」。
 - **接口开在副作用边界上**，不开在仓储上：只需要假工具 6 个方法就能驱动整个循环，不需要 mock GORM。
 
----
+**④ 让 SOP 状态推进可测（并修掉人工步骤「永不超时」）**
+
+SOP 里四种步骤（`react` / `human` / `condition` / `notification`）连成一条状态链：谁先跑、跑完往哪走、什么条件跳过、什么时候整单结束。这条链的判定逻辑全散在 `if step.Type == "..."` 里，同样只能靠起真库验证。
+
+| 文件 | 改动 |
+|---|---|
+| `internal/agent/workflow_state.go` | 新增：`evaluateCondition`（条件判定）、`humanStepTimeoutMinutes`、`humanStepStillWaiting`、`isLastStep`、`humanStepTimers`（定时器注册/取消） |
+| `internal/agent/workflow_state_test.go` | 新增：20 个子用例覆盖条件判定、超时语义、最后一步判定、定时器并发 |
+| `internal/agent/workflow_step.go` | 条件步骤改用 `evaluateCondition`，配置错误直接 `failStep` 而不是静默走「不命中」；超时判定改用 `humanStepStillWaiting` |
+| `internal/agent/step_lifecycle.go` | `completeStep` / `failStep` 改用 `isLastStep` 与统一的定时器取消 |
+| `internal/agent/approval_service.go` | `ReviseStep` 打回重跑时取消旧定时器 |
+
+三个真问题：
+
+1. **人工步骤永远不会超时（超时逻辑是死代码）。** `executeHumanStep` 先把状态置成 `running` 再启动定时器，而定时器到点后的判断是 `if saved.Status != "pending" { return }`——状态早就不是 `pending` 了，所以到点必然直接 return，`timeout_minutes` 配了等于没配。
+2. **条件写错会静默走错分支。** 上游用 `ticket.Status == cfg.Value` 直接比 `interface{}`，值类型不对（比如配了数字）不报错、只是安静地返回 false；运算符不在支持范围（只实现了 `eq`，`assignee_id` 只实现了 `ne` + null）也不报错。分支走错比直接报错难查得多，现在改成显式类型断言 + 运算符白名单，不认识就 `failStep` 并写清原因。
+3. **打回重跑会被上一个定时器误杀。** `ReviseStep` 把步骤重置为 `pending` 后重新执行，但没取消旧的定时器；修掉问题 1 之后，旧定时器到点就会把新一轮尝试判成超时。现在打回时会先取消。
 
 设计取舍：
-- **默认行为不变**——不设环境变量时，API 仍自带内嵌扫描器，老部署无需任何改动。
-- **worker 不执行 AutoMigrate**——schema 归 API 所有，两个进程同时迁移会打架，所以 compose 里让 worker 等 API 先启动，K8s 里用 initContainer 查 `to_regclass('public.tickets')` 等表就绪。
-- **worker 不拉渠道客户端**——`SLAConfigService` 的 `eventHandler` 传 `nil`（内部已判空），worker 只负责站内通知 + 推送方式 + webhook；飞书等渠道消息仍由 API 侧 gateway 发送，避免同一个告警发两遍。
+- **问题 1、3 是「修 bug」，问题 2 是「行为变更」**——`condition` 步骤配了不支持的字段/运算符，以前静默跳过，现在会让步骤失败。我倾向于让配置错误在第一次执行时就炸出来，但这确实改变了既有 SOP 的行为，如果你有历史 SOP 用了其他运算符，需要先改配置。
+- **步骤推进本身仍未做跨副本互斥**：`executeNextStep` 是「查 pending → 取第一条 → 置 running」，两个副本同时推进同一个 workflow 理论上能重复启动同一步。做这件事需要把 `pglock` 的 advisory lock 下沉到 workflow 粒度（`pkg/pglock` 已经具备能力），属于下一步而不是这一轮。
 
 验证情况：
 - ✅ `go build ./...`、`go vet` 通过
 - ✅ `go test ./internal/ticket/ -run TestDecideSLAAction` 13/13 通过
-- ✅ `go test ./internal/agent/` 22 个子用例全部通过（`internal/agent` 从零覆盖变为有覆盖）
+- ✅ `go test ./internal/agent/` 13 个测试函数、42 个子用例全部通过（`internal/agent` 从零覆盖变为有覆盖）
 - ✅ `kubectl kustomize` 渲染 base / dev overlay 通过；`scripts/validate-k8s.py` 全部检查通过
 - ⚠️ **镜像未实机构建、清单未在真实集群 apply**（本机无 Docker / 无可用集群）。Dockerfile 与清单做的是静态校验，首次在集群里跑仍可能需要调（例如 StorageClass 名字、ingress 控制器差异）
+- ⚠️ **`-race` 未跑**：本机无 cgo 工具链，并发用例只做了 `-count=20` 重复执行，没有用 race detector 验证
 
 ---
 
@@ -518,20 +539,20 @@ go test ./... -v
 go test -coverprofile=coverage.out ./...
 ```
 
-当前测试覆盖 4 个包：`internal/model`、`internal/service`（auth）、`internal/ticket`（service + SLA 决策）、`internal/agent`（ReAct 循环）。**整体覆盖率仍然不高**，这是上游现状。
+当前测试覆盖 4 个包：`internal/model`、`internal/service`（auth）、`internal/ticket`（service + SLA 决策）、`internal/agent`（ReAct 循环 + SOP 状态推进）。**整体覆盖率仍然不高**，这是上游现状。
 
 本仓库新增的部分有单测兜底：
 
 ```bash
-go test ./internal/ticket/ -run TestDecideSLAAction -v   # 13 个用例
-go test ./internal/agent/ -run 'TestRunReActLoop|TestParseReActAction' -v   # ReAct 循环 22 个子用例
+go test ./internal/ticket/ -run TestDecideSLAAction -v                    # 13 个用例
+go test ./internal/agent/ -run 'TestRunReActLoop|TestParseReActAction' -v  # ReAct 循环 22 个子用例
+go test ./internal/agent/ -run 'TestEvaluateCondition|TestHumanStep|TestIsLastStep' -v  # SOP 状态推进 20 个子用例
 ```
 
-ReAct 循环原来是「起真 PG + 真模型才能验证」的黑盒，这次把它拆成可测的编排层（见下方「对上游的实质改动」）：
+这两个原本都是「起真 PG + 真模型才能验证」的黑盒，现在都拆成了可测的纯函数 / 编排层（见下方「本仓库的改动」）：
 
-- `reactToolset` 接口隔离 DB / LLM 副作用，`runReActLoop` 只做编排 → 用假工具就能跑完整轨迹
-- 覆盖：正常 `complete`、`search_kb` 观察值回灌、非法 JSON 纠错重试、未知工具反馈、`fail`、LLM 报错、轮数耗尽、历史窗口裁剪
-- 顺带修掉两个真 bug：**模型把 JSON 包在 ```` ```json ```` 里时解析必失败**（上游会一路重试到轮数耗尽，然后把什么都没做的步骤标记为「已完成」）；**队列版循环只取 `messages[0]`**，一批涌入的多条用户消息被静默丢弃
+- **ReAct 循环**：`reactToolset` 接口隔离 DB / LLM 副作用，假工具就能跑完整轨迹。覆盖正常 `complete`、观察值回灌、非法 JSON 纠错、未知工具反馈、`fail`、LLM 报错、轮数耗尽、历史窗口裁剪
+- **SOP 状态推进**：`evaluateCondition` / `isLastStep` / `humanStepStillWaiting` / `humanStepTimers` 全是纯逻辑。覆盖条件判定 20 例、超时语义、最后一步判定、定时器并发注册与取消
 
 ---
 
@@ -544,7 +565,8 @@ ReAct 循环原来是「起真 PG + 真模型才能验证」的黑盒，这次�
 - [x] **容器化改造**：`deployments/k8s/`（Deployment / HPA / PDB / Ingress / ConfigMap / Secret + dev overlay）
 - [x] **探针拆分**：`/health` 与 `/readyz` 分离，迁移并发问题用 advisory lock 解决
 - [x] **ReAct 循环测试**：抽出 `reactToolset` 接口 + `parseReActAction` 纯函数，22 个子用例覆盖完整轨迹
-- [ ] **SOP 状态推进测试**：步骤流转仍是最该被测试保护的部分，目前零覆盖
+- [x] **SOP 状态推进测试**：条件判定 / 超时语义 / 最后一步判定 / 定时器抽成纯逻辑，20 个子用例；顺带修掉人工步骤「永不超时」
+- [ ] **步骤推进的跨副本互斥**：`executeNextStep` 没有分布式锁，多副本下同一 workflow 可能被并发推进（`pglock` 已具备能力）
 - [ ] **接本地推理**：把 provider 指向 vLLM / Ollama，验证「私有化部署 + 本地模型」这条链路
 - [ ] **可观测性**：接入 Prometheus 指标（工单量、ReAct 轮次、LLM 延迟与 token 成本）
 

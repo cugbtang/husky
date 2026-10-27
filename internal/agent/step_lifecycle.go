@@ -9,9 +9,7 @@ import (
 )
 
 func (s *WorkflowService) completeStep(ctx context.Context, step *model.WorkflowStep, result string) {
-	if cancel, ok := s.humanStepCancels.LoadAndDelete(step.ID); ok {
-		cancel.(context.CancelFunc)()
-	}
+	s.humanStepCancels.cancel(step.ID)
 	now := time.Now()
 	step.Status = "completed"
 	step.Result = result
@@ -20,8 +18,7 @@ func (s *WorkflowService) completeStep(ctx context.Context, step *model.Workflow
 
 	wf, _ := s.wfRepo.GetByID(ctx, step.WorkflowID)
 	if wf != nil {
-		isLast := step.StepIndex >= wf.TotalSteps-1
-		if isLast {
+		if isLastStep(step.StepIndex, wf.TotalSteps) {
 			wf.Status = "completed"
 			s.wfRepo.Update(ctx, wf)
 
@@ -40,9 +37,7 @@ func (s *WorkflowService) completeStep(ctx context.Context, step *model.Workflow
 }
 
 func (s *WorkflowService) failStep(ctx context.Context, step *model.WorkflowStep, reason string) {
-	if cancel, ok := s.humanStepCancels.LoadAndDelete(step.ID); ok {
-		cancel.(context.CancelFunc)()
-	}
+	s.humanStepCancels.cancel(step.ID)
 	now := time.Now()
 	step.Status = "failed"
 	step.Result = reason

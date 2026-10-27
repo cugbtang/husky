@@ -45,20 +45,15 @@ func (s *WorkflowService) executeHumanStep(ctx context.Context, step *model.Work
 	}
 
 	// 4. 超时处理
-	var cfg struct {
-		TimeoutMinutes int `json:"timeout_minutes"`
-	}
+	var cfg humanStepConfig
 	if step.Config != "" {
 		if err := json.Unmarshal([]byte(step.Config), &cfg); err != nil {
 			log.Printf("executeHumanStep: failed to parse config: %v", err)
 		}
 	}
-	if cfg.TimeoutMinutes <= 0 {
-		cfg.TimeoutMinutes = 1440
-	}
 
-	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutMinutes)*time.Minute)
-	s.humanStepCancels.Store(step.ID, timeoutCancel)
+	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, time.Duration(humanStepTimeoutMinutes(cfg))*time.Minute)
+	s.humanStepCancels.register(step.ID, timeoutCancel)
 
 	go func(stepID uint, cancel context.CancelFunc) {
 		defer cancel()
@@ -67,7 +62,8 @@ func (s *WorkflowService) executeHumanStep(ctx context.Context, step *model.Work
 			return
 		}
 		saved, err := s.wfRepo.GetStepByID(context.WithoutCancel(ctx), stepID)
-		if err != nil || saved.Status != "pending" {
+		// 步骤可能已被审批/拒绝/打回，此时不该再判超时。
+		if err != nil || !humanStepStillWaiting(saved.Status) {
 			return
 		}
 		s.failStep(context.WithoutCancel(ctx), saved, "human step timed out")
@@ -142,40 +138,31 @@ func (s *WorkflowService) generateSuggestion(ctx context.Context, ticket *model.
 }
 
 func (s *WorkflowService) executeConditionStep(ctx context.Context, step *model.WorkflowStep, ticket *model.Ticket) {
-	var cfg struct {
-		Field    string      `json:"field"`
-		Operator string      `json:"operator"`
-		Value    interface{} `json:"value"`
-	}
+	var cfg conditionConfig
 	if step.Config != "" {
 		if err := json.Unmarshal([]byte(step.Config), &cfg); err != nil {
 			log.Printf("executeConditionStep: failed to parse config: %v", err)
 		}
 	}
 
-	matched := false
-	switch cfg.Field {
-	case "status":
-		if cfg.Operator == "eq" && ticket.Status == cfg.Value {
-			matched = true
-		}
-	case "priority":
-		if cfg.Operator == "eq" && ticket.Priority == cfg.Value {
-			matched = true
-		}
-	case "assignee_id":
-		if cfg.Operator == "ne" && cfg.Value == nil {
-			matched = ticket.AssigneeID != nil
-		}
+	matched, err := evaluateCondition(cfg, ticket)
+	if err != nil {
+		// 条件写错就直接失败，而不是静默走「不命中」分支：分支走错的事后排查
+		// 成本远高于在第一次执行时暴露出来。
+		s.failStep(ctx, step, fmt.Sprintf("invalid condition config: %v", err))
+		return
 	}
 
 	if matched {
 		s.completeStep(ctx, step, "condition matched")
-	} else {
-		step.Status = "skipped"
-		s.wfRepo.UpdateStep(ctx, step)
-		s.executeNextStep(ctx, step.WorkflowID)
+		return
 	}
+
+	now := time.Now()
+	step.Status = "skipped"
+	step.CompletedAt = &now
+	s.wfRepo.UpdateStep(ctx, step)
+	s.executeNextStep(ctx, step.WorkflowID)
 }
 
 func (s *WorkflowService) executeNotificationStep(ctx context.Context, step *model.WorkflowStep, ticket *model.Ticket) {
