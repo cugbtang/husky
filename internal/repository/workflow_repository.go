@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/husky/husky/internal/model"
 	"gorm.io/gorm"
@@ -106,6 +107,37 @@ func (r *WorkflowRepository) GetPendingSteps(ctx context.Context, workflowID uin
 // UpdateStep 更新步骤
 func (r *WorkflowRepository) UpdateStep(ctx context.Context, step *model.WorkflowStep) error {
 	return r.db.WithContext(ctx).Save(step).Error
+}
+
+// HasRunningStep 该工作流是否已有步骤处于 running。
+//
+// 用来挡住「后一步被提前启动」：executeNextStep 原来只查 status='pending' 取第一条，
+// 于是当两个调用方同时推进同一张工单时，第二个会跳过正在执行的步骤、直接把后一步
+// 也跑起来，两步并发执行、顺序全乱。
+func (r *WorkflowRepository) HasRunningStep(ctx context.Context, workflowID uint) (bool, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&model.WorkflowStep{}).
+		Where("workflow_id = ? AND status = ?", workflowID, "running").
+		Count(&count).Error
+	return count > 0, err
+}
+
+// ClaimStep 原子地把步骤从 pending 置为 running。
+//
+// 返回 false 表示这一步已经被别人抢走（或状态已不是 pending），调用方必须放弃执行。
+// 这是「同一步只执行一次」的唯一硬保证：进程内的锁和 advisory lock 都可能因为
+// ctx 超时、连接断开而失效，而带 status 条件的 UPDATE 是数据库级别的 CAS。
+func (r *WorkflowRepository) ClaimStep(ctx context.Context, stepID uint, startedAt time.Time) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&model.WorkflowStep{}).
+		Where("id = ? AND status = ?", stepID, "pending").
+		Updates(map[string]interface{}{
+			"status":     "running",
+			"started_at": startedAt,
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
 }
 
 // ListFeedbackExamples 获取最近的 HITL 反馈示例（已完成的 human 步骤，有 feedback/decision）

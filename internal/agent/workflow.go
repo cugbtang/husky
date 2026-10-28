@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"sync"
-	"time"
 
 	"github.com/husky/husky/internal/model"
 	"github.com/husky/husky/internal/repository"
@@ -23,6 +22,9 @@ type WorkflowService struct {
 
 	workflowMu       sync.Map
 	humanStepCancels humanStepTimers
+
+	// locker 保护「同一 workflow 的推进」，nil 表示单进程模式（见 SetDB）。
+	locker workflowLocker
 }
 
 func NewWorkflowService(
@@ -131,31 +133,31 @@ func (s *WorkflowService) buildStep(workflowID uint, index int, step SOPStep, ti
 	return ws
 }
 
+// executeNextStep 把工作流往前推一步。
+//
+// 上游的写法是「查 pending → 取第一条 → 置 running → 执行」四步裸奔，中间没有任何
+// 互斥：API 上 HPA 多副本后，两个副本同时推进同一张工单，会各自把同一步跑一遍。
+// 现在拆成两段：
+//
+//  1. 锁内判定 + 抢占（claimNextForWorkflow）——advisory lock 按 workflow 分片，
+//     ClaimStep 再用 status='pending' 的条件 UPDATE 做数据库级 CAS；
+//  2. 锁外执行（executeStep）——执行可能是一个 ReAct 循环（多次 LLM 调用、几分钟），
+//     把锁持到执行结束会长期占住一条专用连接，也会让同一工单上的人工审批排队等锁。
 func (s *WorkflowService) executeNextStep(ctx context.Context, workflowID uint) {
-	wf, err := s.wfRepo.GetByID(ctx, workflowID)
-	if err != nil || wf == nil {
-		return
-	}
-	pending, err := s.wfRepo.GetPendingSteps(ctx, workflowID)
+	res, err := s.claimNextForWorkflow(ctx, s.wfRepo, workflowID)
 	if err != nil {
+		log.Printf("executeNextStep: workflow %d: claim failed: %v", workflowID, err)
 		return
 	}
-	if len(pending) == 0 {
-		wf.Status = "completed"
-		s.wfRepo.Update(ctx, wf)
-		return
+	switch {
+	case res.Step != nil:
+		s.executeStep(ctx, res.Step, res.WF)
+	case res.Exhausted:
+		log.Printf("workflow %d: no pending step left, marked completed", workflowID)
+	default:
+		// 正常的并发收敛路径：另一个副本/另一次调用正在推进，本次让出。
+		log.Printf("workflow %d: advance skipped (%s)", workflowID, res.Reason)
 	}
-
-	step := pending[0]
-	step.Status = "running"
-	now := time.Now()
-	step.StartedAt = &now
-	s.wfRepo.UpdateStep(ctx, &step)
-
-	wf.CurrentStep = step.StepIndex
-	s.wfRepo.Update(ctx, wf)
-
-	s.executeStep(ctx, &step, wf)
 }
 
 func (s *WorkflowService) executeStep(ctx context.Context, step *model.WorkflowStep, wf *model.Workflow) {

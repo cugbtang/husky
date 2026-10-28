@@ -104,9 +104,9 @@ func (s *WorkflowService) ReviseStep(ctx context.Context, stepID, userID uint, f
 			step.WorkflowID, "workflow")
 	}
 
-	wf, _ := s.wfRepo.GetByID(ctx, step.WorkflowID)
-	if wf != nil {
-		go s.executeStep(context.WithoutCancel(ctx), step, wf)
-	}
+	// 重跑走统一的推进入口，而不是直接 executeStep：这里步骤已经被置回 pending，
+	// 上游却直接开 goroutine 执行它，于是「本 goroutine 正在跑」和「另一次推进把它
+	// 当成待执行步骤抢走」可以同时成立，同一个步骤被跑两遍。
+	go s.executeNextStep(context.WithoutCancel(ctx), step.WorkflowID)
 	return nil
 }

@@ -19,7 +19,7 @@
 > **基于 `ilibx/husky` 的研究型 fork，不是我的原创项目。**
 >
 > - 上游：[**ilibx/husky**](https://github.com/ilibx/husky)（约 23 stars）
-> - 本仓库在上游基础上做了**四处工程改造**：① 把 SLA 扫描从 API 进程里拆成独立 worker；② 补齐一套真能跑起来的 K8s 部署清单；③ 把 ReAct 循环改成可测的编排层（并修掉两个真 bug）；④ 把 SOP 步骤状态推进抽成纯函数（并修掉人工步骤「永不超时」）（见 [改动说明](#本仓库的改动)）
+> - 本仓库在上游基础上做了**五处工程改造**：① 把 SLA 扫描从 API 进程里拆成独立 worker；② 补齐一套真能跑起来的 K8s 部署清单；③ 把 ReAct 循环改成可测的编排层（并修掉两个真 bug）；④ 把 SOP 步骤状态推进抽成纯函数（并修掉人工步骤「永不超时」）；⑤ 给工作流推进加按 workflow 分片的分布式互斥（advisory lock + 数据库 CAS）（见 [改动说明](#本仓库的改动)）
 > - 起点意义：它是一个**可运行的 Agent 工程标本**，用来拆解「Chatbot 之外，Agent 怎么真正嵌进业务流程」
 
 上游的架构与全部业务实现归原作者所有；我改动的是后台任务的生命周期管理、镜像构建链与部署编排。
@@ -102,12 +102,45 @@ SOP 里四种步骤（`react` / `human` / `condition` / `notification`）连成�
 
 设计取舍：
 - **问题 1、3 是「修 bug」，问题 2 是「行为变更」**——`condition` 步骤配了不支持的字段/运算符，以前静默跳过，现在会让步骤失败。我倾向于让配置错误在第一次执行时就炸出来，但这确实改变了既有 SOP 的行为，如果你有历史 SOP 用了其他运算符，需要先改配置。
-- **步骤推进本身仍未做跨副本互斥**：`executeNextStep` 是「查 pending → 取第一条 → 置 running」，两个副本同时推进同一个 workflow 理论上能重复启动同一步。做这件事需要把 `pglock` 的 advisory lock 下沉到 workflow 粒度（`pkg/pglock` 已经具备能力），属于下一步而不是这一轮。
+
+**⑤ 给工作流推进加跨副本互斥（并修掉「同一步跑两遍」）**
+
+`executeNextStep` 原来是四个动作裸奔：查 pending → 取第一条 → 置 running → 执行，中间没有任何互斥。API 上了 HPA 多副本之后，这个缺口有三种表现：
+
+| 场景 | 后果 |
+|---|---|
+| 两个副本同时推进同一张工单 | 同一步被执行两遍：两次 LLM 调用、两条备注、两条通知 |
+| 人工步骤还在等人审核时，另一次推进触发 | 它只查 `status='pending'`，看不见正在 `running` 的人工步骤，直接把后一步也启动，两步并发、顺序错乱 |
+| `ReviseStep` 打回重跑 | 它把步骤置回 `pending` 后自己开 goroutine 执行，同一时刻另一次推进也会把这个 `pending` 步骤抢走 |
+
+| 文件 | 改动 |
+|---|---|
+| `internal/agent/workflow_claim.go` | 新增：`stepClaimRepo` 接口、`claimNextStep`（判定）、`applyClaim`（落库）、`workflowLocker` + `pgWorkflowLocker`、`workflowLock`、`claimNextForWorkflow` |
+| `internal/agent/workflow_claim_test.go` | 新增：13 组判定用例 + 3 组落库 + 6 组锁语义 + 1 组 50 并发 CAS |
+| `internal/agent/workflow.go` | `executeNextStep` 拆成「锁内抢占」+「锁外执行」；`WorkflowService` 新增 `locker` 字段与 `SetDB` |
+| `internal/agent/approval_service.go` | `ReviseStep` 改走统一推进入口，不再自己开 goroutine 直接执行 |
+| `internal/repository/workflow_repository.go` | 新增 `HasRunningStep`、`ClaimStep`（`UPDATE ... WHERE status='pending'` 的 CAS） |
+| `pkg/pglock/pglock.go` | 新增 `WorkflowKey(workflowID)`，按 workflow 分片的 key 空间（与 `WorkerKey` / `MigrationKey` 不相交） |
+| `internal/router/router.go` | `workflowSvc.SetDB(dbConn.DB)` 打开跨副本互斥 |
+
+**两层防线，各管一段，缺一不可：**
+
+1. **advisory lock（按 workflow 分片）** 保证「判定 → 抢占 → 前移指针」是一段临界区，顺带用 `HasRunningStep` 挡住「后一步被提前启动」。
+2. **数据库级 CAS**（`ClaimStep` 的条件 UPDATE）保证同一步只可能被抢占一次。锁会因为 ctx 超时、连接断开、非 PostgreSQL 方言而失效，CAS 是最后一道硬保证。
+
+反过来，只有 CAS 也不够：同一步的重复是 CAS 能挡的，但「后一步被提前启动」是两个**不同** step 之间的竞争，CAS 各抢各的都能成功——那只能靠锁内的 `HasRunningStep`。测试里我把这一条专门断言了（假仓储没有锁，所以确实可能同时启动两个不同步骤，但同一步绝不会被抢两次）。
+
+**锁不跨越执行**：`executeStep` 可能是一个 ReAct 循环（多次 LLM 调用、几分钟），把 advisory lock 持到执行结束会长期占住一条专用连接，也会让同一工单上的人工审批排队等锁。所以 `claimNextForWorkflow` 用 `defer release()` 把锁限定在临界区内，出锁才执行。
+
+另外两个顺带的行为变更：
+- **非 `running` 的工作流不再被推进**。上游没有这个判断：一条已经 `failed` 的工作流，只要有人再触发一次推进，后面所有步骤照跑不误。
+- **锁服务自身报错时不阻断推进**（记 warn 日志后无锁继续），此时只剩 CAS 这一层——宁可少一层保护，也不要在 DB 抖动时把整条 SOP 卡死。
 
 验证情况：
 - ✅ `go build ./...`、`go vet` 通过
 - ✅ `go test ./internal/ticket/ -run TestDecideSLAAction` 13/13 通过
-- ✅ `go test ./internal/agent/` 13 个测试函数、42 个子用例全部通过（`internal/agent` 从零覆盖变为有覆盖）
+- ✅ `go test ./internal/agent/` 18 个测试函数、64 个子用例全部通过；`go test ./pkg/pglock/` 2 个函数通过
+- ⚠️ **锁本身没有在真实 PostgreSQL 上跑过**：本机无 Docker / 无可用 PG，`pglock` 的可用性验证依赖 K8s 清单里已有的 `pg_try_advisory_lock` 路径与单元测试的 key 隔离断言。首次上集群时建议 `kubectl exec` 进 pod 手工验一次「两个副本只有一个是 holder」
 - ✅ `kubectl kustomize` 渲染 base / dev overlay 通过；`scripts/validate-k8s.py` 全部检查通过
 - ⚠️ **镜像未实机构建、清单未在真实集群 apply**（本机无 Docker / 无可用集群）。Dockerfile 与清单做的是静态校验，首次在集群里跑仍可能需要调（例如 StorageClass 名字、ingress 控制器差异）
 - ⚠️ **`-race` 未跑**：本机无 cgo 工具链，并发用例只做了 `-count=20` 重复执行，没有用 race detector 验证
@@ -396,6 +429,14 @@ python3 scripts/validate-k8s.py deployments/k8s/overlays/dev
 6. **`config.yaml` 里有明文数据库凭证**
    仓库内的 `config.yaml` 提交了内网地址与密码。**这是上游的卫生问题**，fork 使用前请改成自己的 localhost 配置，且不要把自己的真实凭证提交回来。
 
+7. **工作流互斥的前提是「所有副本连同一个 PostgreSQL」**
+   advisory lock 是数据库会话级的，副本之间要连同一个库才互斥；如果你把 `SetDB` 去掉（直接在别处构造 `WorkflowService` 而不走 `router.SetupRouter`），就会退回单进程行为——单副本部署没问题，多副本下同一步会被跑两遍。
+
+   另一个更要命的配置项：advisory lock 会**占住一条专用连接**直到解锁，锁内还要发查询，所以 `DB_MAX_OPEN_CONNS` 不能设成 1（默认 100），否则推进线程会自己等自己。
+
+8. **`running` 的步骤没有看门狗**
+   执行到一半进程被 kill，步骤会永远停在 `running`。人工步骤有 `timeout_minutes` 兜底；`react` 步骤没有，而第 ⑤ 项改造之后它会挡住整条工作流的推进（以前是「跳过它继续跑」，现在是「等它」）。修复方向是给步骤加租约字段，比现在更接近正确做法。
+
 ---
 
 ## 项目结构
@@ -539,7 +580,7 @@ go test ./... -v
 go test -coverprofile=coverage.out ./...
 ```
 
-当前测试覆盖 4 个包：`internal/model`、`internal/service`（auth）、`internal/ticket`（service + SLA 决策）、`internal/agent`（ReAct 循环 + SOP 状态推进）。**整体覆盖率仍然不高**，这是上游现状。
+当前测试覆盖 5 个包：`internal/model`、`internal/service`（auth）、`internal/ticket`（service + SLA 决策）、`internal/agent`（ReAct 循环 + SOP 状态推进 + 步骤抢占）、`pkg/pglock`（锁 key 隔离）。**整体覆盖率仍然不高**，这是上游现状。
 
 本仓库新增的部分有单测兜底：
 
@@ -547,12 +588,15 @@ go test -coverprofile=coverage.out ./...
 go test ./internal/ticket/ -run TestDecideSLAAction -v                    # 13 个用例
 go test ./internal/agent/ -run 'TestRunReActLoop|TestParseReActAction' -v  # ReAct 循环 22 个子用例
 go test ./internal/agent/ -run 'TestEvaluateCondition|TestHumanStep|TestIsLastStep' -v  # SOP 状态推进 20 个子用例
+go test ./internal/agent/ -run 'TestClaim|TestApplyClaim|TestSetDB' -v     # 步骤抢占与锁语义 22 个子用例
+go test ./pkg/pglock/ -v                                                   # 锁 key 空间隔离
 ```
 
-这两个原本都是「起真 PG + 真模型才能验证」的黑盒，现在都拆成了可测的纯函数 / 编排层（见下方「本仓库的改动」）：
+这几个原本都是「起真 PG + 真模型才能验证」的黑盒，现在都拆成了可测的纯函数 / 编排层（见下方「本仓库的改动」）：
 
 - **ReAct 循环**：`reactToolset` 接口隔离 DB / LLM 副作用，假工具就能跑完整轨迹。覆盖正常 `complete`、观察值回灌、非法 JSON 纠错、未知工具反馈、`fail`、LLM 报错、轮数耗尽、历史窗口裁剪
 - **SOP 状态推进**：`evaluateCondition` / `isLastStep` / `humanStepStillWaiting` / `humanStepTimers` 全是纯逻辑。覆盖条件判定 20 例、超时语义、最后一步判定、定时器并发注册与取消
+- **步骤抢占**：`stepClaimRepo` 接口隔离仓储，`claimNextStep` 只做判定。覆盖 13 条判定分支（含 CAS 失败、工作流已失败、已有步骤在跑）、落库两条路径、6 组锁语义（拿不到锁完全不碰 DB、出锁后才返回、锁报错退化为无锁）、50 并发下同一步只被抢一次
 
 ---
 
@@ -566,7 +610,8 @@ go test ./internal/agent/ -run 'TestEvaluateCondition|TestHumanStep|TestIsLastSt
 - [x] **探针拆分**：`/health` 与 `/readyz` 分离，迁移并发问题用 advisory lock 解决
 - [x] **ReAct 循环测试**：抽出 `reactToolset` 接口 + `parseReActAction` 纯函数，22 个子用例覆盖完整轨迹
 - [x] **SOP 状态推进测试**：条件判定 / 超时语义 / 最后一步判定 / 定时器抽成纯逻辑，20 个子用例；顺带修掉人工步骤「永不超时」
-- [ ] **步骤推进的跨副本互斥**：`executeNextStep` 没有分布式锁，多副本下同一 workflow 可能被并发推进（`pglock` 已具备能力）
+- [x] **步骤推进的跨副本互斥**：advisory lock 按 workflow 分片（只覆盖判定，不覆盖执行）+ `ClaimStep` 的数据库 CAS，22 个子用例
+- [ ] **running 步骤的看门狗**：进程在执行到一半时被 kill，步骤会永远停在 `running`，而现在的互斥逻辑会因此挡住整条工作流。人工步骤有 `timeout_minutes` 兜底，`react` 步骤没有——需要一个租约/心跳字段
 - [ ] **接本地推理**：把 provider 指向 vLLM / Ollama，验证「私有化部署 + 本地模型」这条链路
 - [ ] **可观测性**：接入 Prometheus 指标（工单量、ReAct 轮次、LLM 延迟与 token 成本）
 

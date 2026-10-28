@@ -37,6 +37,20 @@ const (
 	MigrationKey int64 = 0x4855534D
 )
 
+// WorkflowKeyPrefix 是「按对象分片」的锁的 key 空间前缀（"HW" + 6 个零字节）。
+//
+// 上面的 WorkerKey / MigrationKey 是约 1.2e9 的小整数，而前缀是 5.2e18 量级，
+// 两者不会撞上；同一前缀内的不同对象由低 32 位区分。
+const WorkflowKeyPrefix int64 = 0x4857000000000000
+
+// WorkflowKey 返回某个 workflow 推进锁的 key。
+//
+// 粒度选在「单个 workflow」而不是全局一把锁：不同工单的 SOP 推进互不干扰，
+// 只有同一张工单的并发推进才需要串行化。
+func WorkflowKey(workflowID uint) int64 {
+	return WorkflowKeyPrefix | int64(workflowID&0xFFFFFFFF)
+}
+
 // noop 用于「不需要锁」的路径，保证释放函数永远可调用。
 var noop = func() {}
 

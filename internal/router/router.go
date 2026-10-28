@@ -111,6 +111,9 @@ func SetupRouter(cfg *config.Config, dbConn *repository.DatabaseConnection, log 
 	wfRepo := repository.NewWorkflowRepository(dbConn.DB)
 	workflowSvc := agent.NewWorkflowService(wfRepo, ticketRepo, agentRepo, kbRepo, chatSvc)
 	workflowSvc.SetAgentUserID(1)
+	// 开启按 workflow 分片的 advisory lock：多副本部署时同一张工单的 SOP 推进
+	// 会串行化，避免两个副本把同一步各跑一遍。
+	workflowSvc.SetDB(dbConn.DB)
 	sopMatcher := agent.NewSOPMatcher(sopRepo, workflowSvc, chatSvc)
 	agentEngine := agent.NewEngine(agentRepo, ticketRepo, kbRepo, chatSvc, ticketSvc)
 	agentSvc := agent.NewService(agentRepo)
